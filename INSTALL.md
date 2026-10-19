@@ -186,6 +186,53 @@ client 会经 `wslpath -w` 转换（`/mnt/d/x` → `D:\x`；WSL 内路径 → `\
 注意：COM 端保存到 UNC 路径（WSL 原生文件系统）部分 WPS 版本可能不支持另存，
 **需要被 Windows 应用直接读写的文件建议放在 /mnt/c、/mnt/d 等 Windows 盘挂载路径下**。
 
+#### 在 DSH（DeepSeek Harness）中注册
+
+DSH 的 Agent 运行在 WSL 内时，把 MCP Server 注册为一个 **stdio 自定义连接器**即可，
+command/args/cwd 全部写 WSL 内的 Linux 路径（DSH 在 WSL 内启动 node，脚本内部再转换给宿主机 PowerShell）。
+
+方式一：在 DSH 对话中直接让 Agent 用连接器工具注册（等价的自定义 stdio 配置）：
+
+- 类型：stdio
+- command：`node`
+- args：`["<项目根目录>/wps-office-mcp/dist/index.js"]`（例如 `/home/you/dev/wps-skills/wps-office-mcp/dist/index.js`）
+- cwd（工作目录）：`<项目根目录>/wps-office-mcp`
+- serverName / 展示名：`wps-office`（决定工具前缀 `mcp__wps-office__*`）
+
+方式二：用 DSH 的 JSON 导入（`mcp_connector_import_json`），内容形如：
+
+```json
+{
+  "mcpServers": {
+    "wps-office": {
+      "command": "node",
+      "args": ["/home/you/dev/wps-skills/wps-office-mcp/dist/index.js"],
+      "cwd": "/home/you/dev/wps-skills/wps-office-mcp"
+    }
+  }
+}
+```
+
+> 路径请替换为本机实际的 WSL 绝对路径；先跑过 `bash scripts/install-wsl.sh` 确保 `dist/index.js` 已构建。
+
+注册后在连接器状态中应看到约 **250 个工具**（前缀 `mcp__wps-office__*`）。
+若首次显示工具未加载，对该连接器执行一次 reconnect / 健康检查即可。
+
+DSH 内快速验收（让 Agent 依次调用）：
+
+1. `wps_common_ping` → 返回「WPS连接正常！pong」
+2. `wps_common_wire_check` / `wps_check_connection` → connected
+3. Excel 闭环：`wps_excel_create_workbook` → `wps_excel_write_range`（含数字）→ `wps_excel_read_range`
+4. Word 闭环：`wps_execute_method`(method=`createDocument`, appType=`wps`) → `wps_insert_text`
+   → `wps_common_save_as`（filePath 可写 `/mnt/c/Users/<用户>/Desktop/xxx.docx` 直接存到 Windows 桌面）
+
+说明：
+
+- WSL 下不需要安装任何 WPS JS 加载项；DSH 经 interop 复用 Windows COM 通道。
+- DSH 的文件沙箱若限制写入 `/mnt/c`、`/mnt/d`，把要保存的文件路径放到允许写入的目录，
+  或由用户授权；测试时已验证 `/mnt/c/Users/<用户>/Desktop` 可正常另存 docx。
+- 连接器若曾以错误配置注册，可用 DSH 的连接器管理面板编辑/重连，无需重启 DSH。
+
 ### Step 4: 验证
 
 ```bash
