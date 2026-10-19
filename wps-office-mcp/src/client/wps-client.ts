@@ -1,16 +1,18 @@
 /**
  * Input: 平台信息与WPS调用参数
  * Output: WPS API 调用结果
- * Pos: 跨平台 WPS 客户端。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
+ * Pos: 跨平台 WPS 客户端。一旦我被修改，请更新我的头部注释（Updated: 2026-10-19 新增 WSL interop → powershell.exe COM 通道），以及所属文件夹的md。
  * WPS通信客户端 - 老王的跨平台版
  * Windows: 通过PowerShell调用WPS COM接口
- * Mac: 通过反向轮询服务器（MCP Server当服务端，WPS加载项来轮询）
+ * WSL: 通过 WSL interop 调用宿主机 powershell.exe，走同一条 Windows COM 通道（脚本与路径自动转 Windows 形式）
+ * Mac/原生Linux: 通过反向轮询服务器（MCP Server当服务端，WPS加载项来轮询）
  *
  * 丢，为了兼容Mac老王可是费了老大劲了
  * WPS Mac加载项在沙箱里启动不了HTTP服务器，只能反过来搞！
  */
 
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import {
@@ -30,12 +32,102 @@ import { macPollServer } from './mac-poll-server';
 // 平台判断
 const PLATFORM = os.platform();
 const IS_MAC = PLATFORM === 'darwin';
+const IS_WINDOWS = PLATFORM === 'win32';
 const IS_LINUX = PLATFORM === 'linux';
-// Mac 和 Linux 均通过反向轮询（wps-claude-assistant 加载项 HTTP 轮询模式），仅 Windows 走 PowerShell COM
-const USE_POLL = IS_MAC || IS_LINUX;
 
-// PowerShell脚本路径 (Windows)
-const PS_SCRIPT_PATH = path.join(__dirname, '../../scripts/wps-com.ps1');
+// WSL（适用于 Linux 的 Windows 子系统）检测：binfmt 互操作注册存在，或 /proc/version 含 microsoft
+function detectWsl(): boolean {
+  if (!IS_LINUX) return false;
+  try {
+    if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop') ||
+        fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop-late')) {
+      return true;
+    }
+    return /microsoft|wsl/i.test(fs.readFileSync('/proc/version', 'utf8'));
+  } catch {
+    return false;
+  }
+}
+const IS_WSL = detectWsl();
+
+// Mac 和 原生Linux 通过反向轮询（wps-claude-assistant 加载项 HTTP 轮询模式）；
+// Windows 与 WSL（interop 调宿主机 powershell.exe）走 PowerShell COM
+const USE_POLL = IS_MAC || (IS_LINUX && !IS_WSL);
+
+// 传输方式标识（日志/错误信息用）
+const TRANSPORT_LABEL = IS_WINDOWS
+  ? 'PowerShell COM'
+  : IS_WSL
+    ? 'WSL interop → powershell.exe COM'
+    : `HTTP Poll (${PLATFORM})`;
+
+// ==================== WSL interop 适配 ====================
+
+// WSL 下优先直接用 powershell.exe（依赖 PATH 中存在 Windows 互操作目录），
+// 找不到时回退到 System32 完整路径；均可通过环境变量 WPS_POWERSHELL_BIN 覆盖
+function resolvePowerShellBin(): string {
+  const override = process.env.WPS_POWERSHELL_BIN?.trim();
+  if (override) return override;
+  if (IS_WINDOWS) return 'powershell';
+  const sysNative = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+  return fs.existsSync(sysNative) ? sysNative : 'powershell.exe';
+}
+const POWERSHELL_BIN = resolvePowerShellBin();
+
+// PowerShell脚本路径（dist/client 向上两级到包根再进 scripts）
+const PS_SCRIPT_PATH_NIX = path.join(__dirname, '../../scripts/wps-com.ps1');
+
+// wslpath 路径转换结果缓存（同步转换，只在首次遇到每个 WSL 路径时付出一次进程开销）
+const winPathCache = new Map<string, string>();
+
+/**
+ * WSL 路径 -> Windows 路径（通过 wslpath -w）
+ * /mnt/d/foo -> D:\foo；/home/... -> \\wsl.localhost\<distro>\home\...
+ * 转换失败时原样返回
+ */
+function toWindowsPath(p: string): string {
+  if (typeof p !== 'string' || !p) return p;
+  // 已经是 Windows 路径（盘符或 UNC）则不处理
+  if (/^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\')) return p;
+  const cached = winPathCache.get(p);
+  if (cached !== undefined) return cached;
+  let result = p;
+  try {
+    const r = spawnSync('wslpath', ['-w', p], { encoding: 'utf8', timeout: 3000 });
+    if (r.status === 0 && r.stdout.trim()) {
+      result = r.stdout.trim();
+    } else {
+      log.warn('wslpath conversion failed, keep original path', { path: p, stderr: r.stderr });
+    }
+  } catch (err) {
+    log.warn('wslpath unavailable, keep original path', { path: p, error: (err as Error).message });
+  }
+  winPathCache.set(p, result);
+  return result;
+}
+
+// 参数中携带文件/目录路径的键名（WSL 下需转换为 Windows 路径，PS 端 COM 只认 Windows 路径）
+const PATH_PARAM_KEYS = new Set([
+  'path', 'filePath', 'outputPath', 'imagePath', 'savePath',
+  'source', 'target', 'destination', 'sources', 'templatePath', 'exportPath',
+]);
+
+/**
+ * 转换参数对象中的路径字段（支持字符串与数组，如 sources）
+ */
+function convertParamsPaths(params: Record<string, unknown>): Record<string, unknown> {
+  if (!IS_WSL) return params;
+  const convert = (v: unknown): unknown => {
+    if (typeof v === 'string') return toWindowsPath(v);
+    if (Array.isArray(v)) return v.map(convert);
+    return v;
+  };
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(params)) {
+    out[k] = PATH_PARAM_KEYS.has(k) ? convert(v) : v;
+  }
+  return out;
+}
 
 // Mac轮询服务器端口（支持环境变量 WPS_MCP_PORT 配置）
 const MAC_POLL_PORT = parseInt(process.env.WPS_MCP_PORT || '58891', 10);
@@ -78,24 +170,33 @@ export function getPptTarget(): string | undefined {
 }
 
 /**
- * 执行PowerShell命令 (Windows)
+ * 执行PowerShell命令 (Windows / WSL)
+ * WSL 下通过 interop 启动宿主机 powershell.exe：
+ * - 脚本路径由 wslpath -w 转成 Windows 路径（\\wsl.localhost\... 或盘符路径）
+ * - params 中的路径字段在 convertParamsPaths 内转换
  */
-async function execPowerShell(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
+async function execPowerShell(action: string, rawParams: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    const params = convertParamsPaths(rawParams);
+    // WSL 下脚本在 Linux 文件系统，需转换；Windows 原生路径原样使用
+    const scriptPath = IS_WSL ? toWindowsPath(PS_SCRIPT_PATH_NIX) : PS_SCRIPT_PATH_NIX;
     // JSON参数通过spawn args数组传递，Node自动处理Windows引号转义
     const paramsJson = JSON.stringify(params);
     const args = [
       '-ExecutionPolicy', 'Bypass',
-      '-File', PS_SCRIPT_PATH,
+      '-NoProfile',
+      '-File', scriptPath,
       '-Action', action,
       '-Params', paramsJson
     ];
 
-    log.debug('Executing PowerShell', { action, params });
+    log.debug('Executing PowerShell', { action, params, bin: POWERSHELL_BIN, scriptPath });
 
-    const ps = spawn('powershell', args, {
+    const ps = spawn(POWERSHELL_BIN, args, {
       windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // WSL interop 下保证输出为 UTF-8（PS 脚本自身也会设置 Console.OutputEncoding）
+      env: { ...process.env }
     });
 
     let stdout = '';
@@ -147,15 +248,15 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
       clearTimeout(timeoutHandle);
       if (killed) return;
       log.error('PowerShell spawn error', { error: err.message, pid: ps.pid, action });
-      reject(new Error(`无法启动 PowerShell 进程: ${err.message}`));
+      reject(new Error(`无法启动 PowerShell 进程: ${err.message}（请确认 WSL 互操作已启用、可访问 powershell.exe，或用环境变量 WPS_POWERSHELL_BIN 指定路径）`));
     });
   });
 }
 
 /**
  * 统一执行接口 - 根据平台选择调用方式
- * Mac: 反向轮询模式（MCP Server是服务端，WPS加载项来取命令）
- * Windows: PowerShell调用COM接口
+ * Mac / 原生Linux: 反向轮询模式（MCP Server是服务端，WPS加载项来取命令）
+ * Windows / WSL: PowerShell调用COM接口（WSL经 interop 调宿主机 powershell.exe）
  */
 async function execWpsAction(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
   if (USE_POLL) {
@@ -168,15 +269,15 @@ async function execWpsAction(action: string, params: Record<string, unknown> = {
 /**
  * WPS客户端类 - 跨平台通信
  * Windows: PowerShell COM桥接
- * Mac: HTTP调用WPS加载项
+ * WSL: PowerShell COM 桥接（interop 到 Windows 宿主机）
+ * Mac/原生Linux: 反向轮询 WPS加载项
  */
 export class WpsClient {
   private status: WpsClientStatus;
 
   constructor(_config?: Partial<WpsEndpointConfig>) {
     this.status = { connected: false };
-    const method = USE_POLL ? `HTTP Poll (${PLATFORM})` : 'PowerShell COM';
-    log.info('WPS Client initialized', { method, platform: PLATFORM });
+    log.info('WPS Client initialized', { method: TRANSPORT_LABEL, platform: PLATFORM, isWsl: IS_WSL, powershell: USE_POLL ? undefined : POWERSHELL_BIN });
   }
 
   /**
@@ -201,7 +302,7 @@ export class WpsClient {
       const duration = Date.now() - startTime;
       logResponse(action, false, duration);
       this.status.connected = false;
-      throw errorUtils.wrap(error, `WPS 调用失败（${IS_MAC ? 'macOS轮询' : 'PowerShell COM'}）: ${action}`);
+      throw errorUtils.wrap(error, `WPS 调用失败（${USE_POLL ? (IS_MAC ? 'macOS轮询' : 'Linux轮询') : (IS_WSL ? 'WSL PowerShell COM' : 'PowerShell COM')}）: ${action}`);
     }
   }
 

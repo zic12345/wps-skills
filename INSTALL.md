@@ -105,6 +105,106 @@ grep "claude-assistant" ~/Library/Containers/com.kingsoft.wpsoffice.mac/Data/.ki
 
 ---
 
+## WSL 安装（Linux 侧操控 Windows 版 WPS）
+
+适用场景：DSH/Claude Code 运行在 WSL 中，WPS Office 安装在 Windows 宿主机。
+原理：MCP Server 跑在 Linux 侧，通过 WSL interop 启动宿主机 `powershell.exe`，
+复用 `wps-office-mcp/scripts/wps-com.ps1` 的 COM 通道（ProgID：Ket/Kwps/Kwpp.Application）。
+**不需要安装 WPS JS 加载项，不需要轮询服务**（COM 直接可用）。
+
+### Step 1: 检测前置条件
+
+```bash
+# 必须是 WSL（/proc/version 含 microsoft，或存在 binfmt WSLInterop）
+grep -iE 'microsoft|wsl' /proc/version
+ls /proc/sys/fs/binfmt_misc/WSLInterop* 2>/dev/null
+
+# interop 可用且能找到 PowerShell
+powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+# 若 PATH 中没有，完整路径：/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+
+# Windows 侧 WPS COM 已注册（三个 ProgID 至少存在；WPS 装在 D 盘也一样）
+powershell.exe -NoProfile -Command 'foreach ($id in "Ket.Application","Kwps.Application","Kwpp.Application") { "$id = $(Test-Path \"HKCU:\Software\Classes\$id\")" }'
+
+# Node.js >= 18（Linux 侧）
+node -v
+```
+
+不满足时：
+- interop 被禁用 → 检查 Windows 侧 `wsl.exe --version` 与 `/etc/wsl.conf` 的 `[interop] enabled=true`
+- WPS COM 未注册 → 在 Windows 侧完整安装 WPS，并分别启动过一次 表格/文字/演示
+- Node 缺失 → WSL 内用 nvm 安装 Node 18+
+
+### Step 2: 一键脚本
+
+```bash
+cd <项目根目录>
+bash scripts/install-wsl.sh
+```
+
+脚本依次：确认 WSL → 确认 powershell.exe 与三个 COM ProgID → 执行 `wps-com.ps1 -Action ping` 冒烟
+→ `npm install`（~/.npm 权限异常时自动使用 /tmp 缓存）→ `npm run build` → 打印各 MCP 客户端配置。
+
+手动等价步骤：
+
+```bash
+cd wps-office-mcp
+npm install
+npm run build
+# 冒烟（脚本路径需为 Windows 形式）
+/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
+  -ExecutionPolicy Bypass -NoProfile \
+  -File "$(wslpath -w "$(pwd)/scripts/wps-com.ps1")" -Action ping -Params '{}'
+```
+
+### Step 3: MCP Client 配置
+
+stdio 配置，command/args 全部使用 **Linux 路径**（Node 运行在 WSL 内；脚本内部再自行转换给 PowerShell）：
+
+```json
+{
+  "mcpServers": {
+    "wps-office": {
+      "command": "node",
+      "args": ["<项目根目录>/wps-office-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+可选环境变量：
+
+| 变量 | 作用 |
+|------|------|
+| `WPS_POWERSHELL_BIN` | 覆盖 powershell.exe 路径（默认 PATH 查找，回退 System32 完整路径） |
+| `WPS_MCP_LOG_DIR` | 指定日志目录（默认 `~/.wps-office-mcp/logs`，不可写时回退 `$TMPDIR/wps-office-mcp-logs`） |
+| `WPS_MCP_PORT` | 仅轮询模式使用，WSL 走 COM 时不涉及 |
+| `MCP_CONSOLE_LOG=1` | 调试时输出控制台日志（stdio 生产模式勿开） |
+
+传给工具的**文件路径参数**（filePath/outputPath/imagePath/saveAs 路径等）可直接写 WSL 路径，
+client 会经 `wslpath -w` 转换（`/mnt/d/x` → `D:\x`；WSL 内路径 → `\\wsl.localhost\<发行版>\...` UNC）。
+注意：COM 端保存到 UNC 路径（WSL 原生文件系统）部分 WPS 版本可能不支持另存，
+**需要被 Windows 应用直接读写的文件建议放在 /mnt/c、/mnt/d 等 Windows 盘挂载路径下**。
+
+### Step 4: 验证
+
+```bash
+# stdio 协议级：initialize/tools.list/tools.call(wps_common_ping)
+# 也可直接调用：在 MCP 客户端中执行 wps_common_ping、wps_common_wire_check
+```
+
+成功标志：`wps_common_ping` 返回「WPS连接正常！pong」；
+真实读写可再用 `createWorkbook → setCellValue → getCellValue` 闭环验证。
+
+### WSL 已知问题
+
+- **PowerShell 首次启动慢**：冷启动 `-NoProfile` 约 0.5–2s；每次工具调用是独立进程（与原生 Windows 行为一致）。
+- **WPS 未运行时**：`GetActiveObject` 失败会自动 `New-Object -ComObject` 拉起 WPS（可能弹出启动画面/首次配置向导）。
+- **执行策略**：脚本调用统一带 `-ExecutionPolicy Bypass`，无需修改机器策略。
+- **~/.npm 权限异常**（uid 不匹配等）：安装脚本使用 `/tmp/npm-cache-wps-mcp` 缓存规避；根治可 `sudo chown -R $UID:$GID ~/.npm`。
+
+---
+
 ## Linux 安装
 
 ### Step 1: 检测前置条件

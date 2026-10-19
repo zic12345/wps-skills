@@ -9,7 +9,7 @@ AI编程助手通过自然语言操控WPS Office的MCP工具集。
 本项目是MCP Server + Skills框架，让AI助手（Claude Code/Cursor/Augment等）能操控WPS Office。
 - 231个MCP专业工具 + 12个内置工具 = 243个
 - 支持Excel(82工具) / Word(28工具) / PPT(112工具) / 通用(9工具)
-- 支持macOS、Windows、Linux
+- 支持macOS、Windows、Linux、**WSL**（WSL 内通过 interop 调宿主机 powershell.exe 走 Windows COM，详见 [INSTALL.md](INSTALL.md#wsl-安装linux-侧操控-windows-版-wps)）
 
 ## 前提条件
 
@@ -79,6 +79,8 @@ args = ["/你的路径/wps-skills/wps-office-mcp/dist/index.js"]
 
 ### 步骤4: 安装WPS加载项
 
+> WSL 用户跳过本步：WSL 走 PowerShell COM 通道，不依赖 JS 加载项。直接执行 `bash scripts/install-wsl.sh`，详见 [INSTALL.md](INSTALL.md#wsl-安装linux-侧操控-windows-版-wps)。
+
 ⚠️ 需要人工操作（AI无法直接操作WPS应用）：
 
 ```bash
@@ -124,8 +126,9 @@ Skills层(SKILL.md自然语言指导)
 MCP Server层(239个工具)
   ↓ wpsClient.executeMethod()
 执行层
-  ├── macOS: wps-claude-assistant (227 action, HTTP轮询)
-  └── Windows: wps-com.ps1 (231 action, COM接口)
+  ├── Windows: wps-com.ps1 (231 action, COM接口)
+  ├── WSL:     wsl interop → 宿主机 powershell.exe → wps-com.ps1（同一条 COM 通道，脚本/路径自动转 Windows 形式）
+  └── macOS / 原生Linux: wps-claude-assistant (227 action, HTTP轮询)
 ```
 
 ## 工具清单

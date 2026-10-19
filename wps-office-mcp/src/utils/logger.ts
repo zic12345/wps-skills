@@ -1,13 +1,15 @@
 /**
  * Input: 日志消息与上下文
  * Output: 结构化日志输出
- * Pos: MCP 日志系统模块。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
+ * Pos: MCP 日志系统模块。一旦我被修改，请更新我的头部注释（Updated: 2026-10-19 WSL 支持：日志目录可写性探测+tmp回退），以及所属文件夹的md。
  * 日志工具 - 老王的日志系统
  * 写日志比写代码还规范，报错了至少知道是哪个SB搞出来的
  */
 
 import winston from 'winston';
-import path from 'path';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 /**
  * 日志级别枚举
@@ -36,24 +38,60 @@ const isEnvTrue = (value?: string): boolean => {
 };
 
 /**
+ * 解析可写的日志目录
+ * 优先级：WPS_MCP_LOG_DIR 环境变量 → $HOME/.wps-office-mcp/logs → os.tmpdir() 回退
+ * 全部不可写时返回 null（仅控制台输出，MCP stdio 下即等价于无文件日志，不影响协议）
+ */
+function resolveLogDir(): string | null {
+  const candidates: string[] = [];
+  if (process.env.WPS_MCP_LOG_DIR) {
+    candidates.push(process.env.WPS_MCP_LOG_DIR);
+  }
+  const homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  if (homeDir) {
+    candidates.push(path.join(homeDir, '.wps-office-mcp', 'logs'));
+  }
+  candidates.push(path.join(os.tmpdir(), 'wps-office-mcp-logs'));
+
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      // 触碰测试文件确认确实可写（某些沙箱允许 mkdir 但禁止写文件）
+      const probe = path.join(dir, '.write-probe');
+      fs.writeFileSync(probe, '');
+      fs.rmSync(probe, { force: true });
+      return dir;
+    } catch {
+      // 尝试下一个候选
+    }
+  }
+  return null;
+}
+
+/**
  * 创建Logger实例
  */
 const createLogger = (name: string): winston.Logger => {
-  const homeDir = process.env.HOME || process.env.USERPROFILE || require('os').homedir();
-  const logDir = path.join(homeDir, '.wps-office-mcp', 'logs');
   // MCP 默认走 stdio 协议，stdout 必须保持纯净；仅在显式开启时才输出 Console 日志
   const enableConsoleLog = isEnvTrue(process.env.MCP_CONSOLE_LOG);
-  const transports: winston.transport[] = [
+  const transports: winston.transport[] = [];
+
+  const logDir = resolveLogDir();
+  if (logDir) {
     // 文件输出 - 错误单独记录，出问题好找
-    new winston.transports.File({
-      filename: path.join(logDir, 'error.log'),
-      level: 'error',
-    }),
+    transports.push(
+      new winston.transports.File({
+        filename: path.join(logDir, 'error.log'),
+        level: 'error',
+      }),
+    );
     // 所有日志
-    new winston.transports.File({
-      filename: path.join(logDir, 'combined.log'),
-    }),
-  ];
+    transports.push(
+      new winston.transports.File({
+        filename: path.join(logDir, 'combined.log'),
+      }),
+    );
+  }
 
   if (enableConsoleLog) {
     transports.unshift(
@@ -68,6 +106,8 @@ const createLogger = (name: string): winston.Logger => {
   }
 
   return winston.createLogger({
+    // 无可用 transport（日志目录不可写且未开控制台）时静默丢弃，禁止 winston 自行打日志到 stdout 污染 MCP 协议
+    silent: transports.length === 0,
     level: process.env.LOG_LEVEL || 'info',
     format: winston.format.combine(
       winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),

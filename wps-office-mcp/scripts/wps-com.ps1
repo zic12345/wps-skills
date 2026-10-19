@@ -1,6 +1,6 @@
 ﻿# Input: Action 名称与 JSON 参数
 # Output: WPS COM 调用结果 JSON
-# Pos: Windows COM 桥接脚本。一旦我被修改，请更新我的头部注释（Updated: 2026-05-26 15:30:00 CST），以及所属文件夹的md。
+# Pos: Windows COM 桥接脚本。一旦我被修改，请更新我的头部注释（Updated: 2026-10-19 WSL 联调：新增 Resolve-Sheet 统一解析 sheet，修复 sheet=0/数字串时 DISP_E_BADINDEX；switchSheet 支持 name 参数），以及所属文件夹的md。
 # WPS COM Bridge - PowerShell script for WPS COM operations
 # Full implementation for Excel, Word, PPT, and common conversions
 # Usage: powershell -File wps-com.ps1 -Action <action> -Params <json>
@@ -12,6 +12,34 @@ param(
 
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# ==================== Sheet 解析 ====================
+
+# 统一按 MCP/JSON 传来的 sheet 选择符定位工作表：
+#   $null/空串/0 -> ActiveSheet（MCP 层未指定时用 sheet||0）
+#   数值或纯数字串(>=1) -> 按 1 基索引
+#   其他字符串 -> 按名称
+# 避免直接 Sheets.Item(0) / Sheets.Item("0") 触发 DISP_E_BADINDEX(0x8002000B)。
+function Resolve-Sheet($workbook, $sheetSelector) {
+    if ($null -eq $workbook) { return $null }
+    if ($null -eq $sheetSelector) {
+        try { return $workbook.Application.ActiveSheet } catch { return $null }
+    }
+    if ($sheetSelector -is [int] -or $sheetSelector -is [long] -or $sheetSelector -is [byte]) {
+        if ([int]$sheetSelector -le 0) { return $workbook.Application.ActiveSheet }
+        return $workbook.Sheets.Item([int]$sheetSelector)
+    }
+    $s = [string]$sheetSelector
+    if ([string]::IsNullOrWhiteSpace($s) -or $s -eq '0') {
+        return $workbook.Application.ActiveSheet
+    }
+    if ($s -match '^\d+$') {
+        $idx = [int]$s
+        if ($idx -le 0) { return $workbook.Application.ActiveSheet }
+        return $workbook.Sheets.Item($idx)
+    }
+    return $workbook.Sheets.Item($s)
+}
+
 
 # ==================== COM Object Getters ====================
 
@@ -556,7 +584,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $cell = $sheet.Cells.Item($p.row, $p.col)
         Output-Json @{ success = $true; data = @{ value = $cell.Value2; text = $cell.Text; formula = $cell.Formula } }
     }
@@ -565,7 +593,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $sheet.Cells.Item($p.row, $p.col).Value2 = $p.value
         Output-Json @{ success = $true }
     }
@@ -574,7 +602,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $range = $sheet.Range($p.range)
         $data = @()
         for ($r = 1; $r -le $range.Rows.Count; $r++) {
@@ -589,11 +617,19 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $range = $sheet.Range($p.range)
-        for ($r = 0; $r -lt $p.data.Count; $r++) {
-            for ($c = 0; $c -lt $p.data[$r].Count; $c++) { $range.Cells.Item($r + 1, $c + 1).Value2 = $p.data[$r][$c] }
+        # 逐格 Value2= 对 JSON 反序列化出的 Int32/Decimal 会在 WPS COM 下报 InvalidCast；
+        # 用 object[,] 二维数组整体赋值（Excel/WPS COM 原生支持）。
+        $rows = [int]$p.data.Count
+        $cols = 0
+        foreach ($row0 in $p.data) { if ($row0.Count -gt $cols) { $cols = [int]$row0.Count } }
+        $arr = [Array]::CreateInstance([object], $rows, $cols)
+        for ($r = 0; $r -lt $rows; $r++) {
+            for ($c = 0; $c -lt $p.data[$r].Count; $c++) { $arr.SetValue($p.data[$r][$c], $r, $c) }
         }
+        $range.Value2 = $arr
         Output-Json @{ success = $true }
     }
 
@@ -637,7 +673,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $range = $sheet.Range($p.range)
         $opsResult = @()
         foreach ($op in $p.operations) {
@@ -809,7 +845,7 @@ switch ($Action) {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
-        $sheet = if ($p.sheet -is [int]) { $wb.Sheets.Item($p.sheet) } else { $wb.Sheets.Item($p.sheet) }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $range = if ($p.range) { $sheet.Range($p.range) } else { $sheet.Cells.Item($p.row, $p.col) }
         $range.Formula = $p.formula
         Output-Json @{ success = $true }
@@ -1193,7 +1229,7 @@ switch ($Action) {
     "updateChart" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = if ($p.sheet) { $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $excel.ActiveWorkbook $p.sheet
         $chartObj = $null
         if ($p.chartName) {
             try { $chartObj = $sheet.ChartObjects($p.chartName) } catch {}
@@ -1252,7 +1288,7 @@ switch ($Action) {
     "exportChartAsImage" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = if ($p.sheet) { $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $excel.ActiveWorkbook $p.sheet
         $outputPath = if ($p.outputPath) { $p.outputPath } else { $p.path }
         if ([string]::IsNullOrEmpty($outputPath)) { Output-Json @{ success = $false; error = "Missing outputPath" }; exit }
         $chartName = $p.chartName
@@ -1268,7 +1304,7 @@ switch ($Action) {
     "exportRangeAsImage" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = if ($p.sheet) { $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $excel.ActiveWorkbook $p.sheet
         $outputPath = if ($p.outputPath) { $p.outputPath } else { $p.path }
         if ([string]::IsNullOrEmpty($outputPath)) { Output-Json @{ success = $false; error = "Missing outputPath" }; exit }
         if ([string]::IsNullOrEmpty($p.range)) { Output-Json @{ success = $false; error = "Missing range" }; exit }
@@ -1332,7 +1368,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $name = $sheet.Name
         $excel.DisplayAlerts = $false
         $sheet.Delete()
@@ -1345,7 +1381,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $wb $p.sheet
         $oldName = $sheet.Name
         $sheet.Name = $p.newName
         Output-Json @{ success = $true; data = @{ oldName = $oldName; newName = $p.newName } }
@@ -1356,7 +1392,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $wb $p.sheet
         if ($p.before) {
             $sheet.Copy($wb.Sheets.Item($p.before))
         } elseif ($p.after) {
@@ -1385,7 +1421,12 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = $wb.Sheets.Item($p.sheet)
+        # MCP 层按工作表名调用（参数名 name），兼容旧的 sheet 选择符
+        $selector = if ($p.name) { $p.name } else { $p.sheet }
+        if ($null -eq $selector -or [string]::IsNullOrWhiteSpace([string]$selector)) {
+            Output-Json @{ success = $false; error = "switchSheet requires name" }; exit
+        }
+        $sheet = Resolve-Sheet $wb $selector
         $sheet.Activate()
         Output-Json @{ success = $true; data = @{ activeSheet = $sheet.Name } }
     }
@@ -1395,7 +1436,7 @@ switch ($Action) {
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
         $wb = $excel.ActiveWorkbook
         if ($null -eq $wb) { Output-Json @{ success = $false; error = "No active workbook" }; exit }
-        $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $wb $p.sheet
         if ($p.before) {
             $sheet.Move($wb.Sheets.Item($p.before))
         } elseif ($p.after) {
@@ -1866,7 +1907,7 @@ switch ($Action) {
     "protectSheet" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = if ($p.sheet) { $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $excel.ActiveWorkbook $p.sheet
         $password = if ($p.password) { $p.password } else { "" }
         $sheet.Protect($password, $p.drawingObjects, $p.contents, $p.scenarios)
         Output-Json @{ success = $true; data = @{ sheet = $sheet.Name; protected = $true } }
@@ -1875,7 +1916,7 @@ switch ($Action) {
     "unprotectSheet" {
         $excel = Get-WpsExcel
         if ($null -eq $excel) { Output-Json @{ success = $false; error = "WPS Excel not running" }; exit }
-        $sheet = if ($p.sheet) { $excel.ActiveWorkbook.Sheets.Item($p.sheet) } else { $excel.ActiveSheet }
+        $sheet = Resolve-Sheet $excel.ActiveWorkbook $p.sheet
         $password = if ($p.password) { $p.password } else { "" }
         $sheet.Unprotect($password)
         Output-Json @{ success = $true; data = @{ sheet = $sheet.Name; protected = $false } }
